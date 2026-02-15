@@ -1,0 +1,92 @@
+# DigitalOcean App Platform Specification
+# Deploy this app with: doctl apps create --spec .do/app.yaml
+
+name: algo-trading-v2
+region: fra
+
+# No databases section - using Neon database instead
+
+# Services
+services:
+  # Backend API Server Only (client runs on Vercel)
+  - name: server
+    source:
+      repo_clone_url: https://github.com/whitneyjohn61/algo-trading-v2.git
+      branch: main
+      deploy_on_push: true
+      source_dir: server
+    dockerfile_path: server/Dockerfile
+    
+    # Environment variables
+    envs:
+      - key: NODE_ENV
+        value: "production"
+      - key: PORT
+        value: "5000"
+      - key: DB_ENVIRONMENT
+        value: "neon"
+      # Neon Database connection (set these as secrets in DO dashboard)
+      - key: NEON_DB_HOST
+        scope: RUN_TIME
+        type: SECRET
+      - key: NEON_DB_PORT
+        scope: RUN_TIME
+        type: SECRET
+      - key: NEON_DB_NAME
+        scope: RUN_TIME
+        type: SECRET
+      - key: NEON_DB_USER
+        scope: RUN_TIME
+        type: SECRET
+      - key: NEON_DB_PASSWORD
+        scope: RUN_TIME
+        type: SECRET
+      - key: NEON_DB_SSL
+        value: "true"
+      # Bybit API Keys (set these in DO dashboard as secrets)
+      - key: BYBIT_API_KEY
+        scope: RUN_TIME
+        type: SECRET
+      - key: BYBIT_API_SECRET
+        scope: RUN_TIME
+        type: SECRET
+      # JWT Secret
+      - key: JWT_SECRET
+        scope: RUN_TIME
+        type: SECRET
+      # CORS (Allow Vercel deployment URLs)
+      - key: CLIENT_URL
+        value: "https://algo-trading-v2.vercel.app"
+    
+    # HTTP configuration
+    http_port: 5000
+    
+    # Health check
+    health_check:
+      http_path: /api/health
+      initial_delay_seconds: 40
+      period_seconds: 30
+      timeout_seconds: 10
+      success_threshold: 1
+      failure_threshold: 3
+    
+    # Resource allocation
+    instance_count: 1
+    instance_size_slug: professional-m
+    
+    # Auto-scaling
+    autoscaling:
+      min_instance_count: 1
+      max_instance_count: 3
+      metrics:
+        cpu:
+          percent: 80
+
+# Alerts
+alerts:
+  - rule: DEPLOYMENT_FAILED
+  - rule: DOMAIN_FAILED
+  - rule: CPU_UTILIZATION
+    value: 85
+  - rule: MEM_UTILIZATION
+    value: 90

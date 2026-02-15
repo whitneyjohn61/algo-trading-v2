@@ -1,0 +1,46 @@
+{
+  "name": "algo-trading-v2",
+  "version": "1.0.0",
+  "description": "Portfolio-based multi-strategy algorithmic crypto trading platform",
+  "main": "server/dist/index.js",
+  "scripts": {
+    "dev": "concurrently \"npm run dev:server\" \"npm run dev:client\"",
+    "dev:server": "npm run dev --prefix server",
+    "dev:client": "npm run dev --prefix client",
+    "build": "npm run build:server; npm run build:client",
+    "build:server": "npm run build --prefix server",
+    "build:client": "npm run build --prefix client",
+    "start": "npm start --prefix server",
+    "install:all": "npm install; npm install --prefix server; npm install --prefix client",
+    "type-check": "npm run type-check:server; npm run type-check:client",
+    "type-check:server": "npm run type-check --prefix server",
+    "type-check:client": "npm run type-check --prefix client",
+    "test": "npm test --prefix server; npm test --prefix client",
+    "test:server": "npm test --prefix server",
+    "test:client": "npm test --prefix client",
+    "lint": "npm run lint --prefix server; npm run lint --prefix client",
+    "clean": "npm run clean --prefix server; npm run clean --prefix client"
+  },
+  "keywords": [
+    "trading",
+    "algorithmic",
+    "crypto",
+    "portfolio",
+    "bybit",
+    "nextjs",
+    "nodejs"
+  ],
+  "author": "",
+  "license": "MIT",
+  "devDependencies": {
+    "concurrently": "^9.1.0"
+  },
+  "engines": {
+    "node": ">=22.0.0",
+    "npm": ">=10.0.0"
+  },
+  "workspaces": [
+    "server",
+    "client"
+  ]
+}

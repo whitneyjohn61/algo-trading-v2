@@ -229,6 +229,116 @@ client/
 
 ---
 
+## Database Management
+
+### Strategy: Schema-first + Raw SQL Migrations
+
+The project uses raw SQL for all database operations (via `pg` client). The migration system
+follows the same philosophy — no ORM, no query builder, just numbered SQL files with a
+lightweight runner.
+
+### Two-Layer Approach
+
+**Layer 1: Full Schema (`schema.ts`)**
+- Contains the complete current schema as `CREATE TABLE IF NOT EXISTS` statements
+- Used for fresh installs (new dev, Docker rebuild, CI test databases)
+- Always represents the "latest" database state
+- Run by: `initializeSchema()` during server startup
+
+**Layer 2: Migrations (`server/migrations/`)**
+- Numbered SQL files for incremental changes to existing databases
+- Used when the schema evolves after initial deployment
+- Each migration runs exactly once, tracked in a `_migrations` table
+- Run by: `migrate.ts` script (before server start in prod, or manually in dev)
+
+### Migration File Format
+
+```
+server/migrations/
+├── 001_initial_baseline.sql        ← empty (marks schema.ts as the baseline)
+├── 002_add_strategy_metrics.sql    ← ALTER TABLE strategy_performance ADD ...
+├── 003_add_trade_tags.sql          ← ALTER TABLE trades ADD COLUMN tags jsonb
+└── ...
+```
+
+Each file:
+```sql
+-- Migration: 002_add_strategy_metrics
+-- Description: Add sharpe ratio and win rate columns to strategy_performance
+-- Date: 2026-03-15
+
+ALTER TABLE strategy_performance ADD COLUMN IF NOT EXISTS sharpe_ratio DECIMAL(10,4);
+ALTER TABLE strategy_performance ADD COLUMN IF NOT EXISTS win_rate DECIMAL(5,4);
+```
+
+### Migration Tracking Table
+
+```sql
+CREATE TABLE IF NOT EXISTS _migrations (
+  id SERIAL PRIMARY KEY,
+  name VARCHAR(255) NOT NULL UNIQUE,
+  applied_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+```
+
+### Migration Runner (`server/src/services/database/migrate.ts`)
+
+```
+1. Connect to database
+2. Ensure _migrations table exists
+3. Read all .sql files from server/migrations/ (sorted by number prefix)
+4. Query _migrations for already-applied files
+5. For each unapplied migration (in order):
+   a. BEGIN transaction
+   b. Execute SQL
+   c. INSERT into _migrations
+   d. COMMIT
+   e. Log success
+6. If any migration fails: ROLLBACK, log error, abort remaining
+```
+
+### Environment-Specific Workflows
+
+**Local Development (Docker Compose PostgreSQL):**
+```
+First time:  docker compose up → schema.ts runs (CREATE TABLE IF NOT EXISTS) → done
+Schema change: write migration .sql → run `npm run migrate` → update schema.ts to match
+Fresh reset:  npm run db:reset (drops all tables, re-runs schema.ts)
+```
+
+**Production (Neon Serverless PostgreSQL):**
+```
+First deploy:  schema.ts runs on first server start → baseline migration recorded
+Schema change: write migration .sql → deploy → migration runs before server accepts traffic
+Rollback:      write a new "undo" migration (no automatic rollback — explicit is safer)
+```
+
+**CI/Test Databases:**
+```
+Each test run: create temp schema → run schema.ts → run tests → drop schema
+No migrations needed in CI — always starts fresh from schema.ts
+```
+
+### Commands
+
+```
+npm run migrate          ← apply pending migrations
+npm run migrate:status   ← show applied/pending migrations
+npm run db:reset         ← drop all + re-run schema.ts (dev only, requires --confirm flag)
+```
+
+### Rules
+
+- **schema.ts stays in sync**: after writing a migration, update schema.ts so it reflects the
+  new state. Fresh installs use schema.ts; existing databases use migrations.
+- **Migrations are append-only**: never edit an already-applied migration. Write a new one.
+- **No down migrations**: if something goes wrong, write a new forward migration to fix it.
+  Automatic rollbacks create false confidence.
+- **Test migrations locally first**: run against Docker Compose DB before pushing to prod.
+- **Keep migrations small**: one concern per file. Easier to review, easier to debug.
+
+---
+
 ## Phase 1: Server Foundation
 
 ### Step 1.1: Database & Config
@@ -243,6 +353,7 @@ client/
   - `portfolio_snapshots` (NEW)
   - `funding_payments` (NEW)
   - `strategy_performance` (NEW)
+- Database migration system (see "Database Management" section below)
 - Environment config with validation
 
 ### Step 1.2: Auth & Users
@@ -699,31 +810,61 @@ client/
 
 ---
 
-## Phase 11: Testing
+## Phase 11: Test Hardening & Coverage
 
-### Step 11.1: Server Unit Tests
-- Indicator calculation verification (each indicator)
-- Strategy signal logic (each strategy)
-- Risk validation rules
-- Portfolio manager allocation/drawdown
-- Bybit mapper (raw → unified type conversion)
-- Trade service CRUD
+Testing is **incremental** — unit tests ship with each phase, integration tests are added at
+key milestones, and Phase 11 is a hardening pass that fills gaps and adds load/edge-case testing.
 
-### Step 11.2: Server Integration Tests
-- Bybit API connectivity (testnet)
-- Trade API endpoints
-- Portfolio API endpoints
-- Strategy API endpoints
-- WebSocket events
-- Backtest execution
+### Incremental Testing Schedule (built into each phase)
 
-### Step 11.3: Client Unit Tests
-- Zustand store logic (portfolio, strategy, trade)
-- Component rendering (portfolio dashboard, strategy cards, positions table)
+```
+Phase   Test Type          What Gets Tested
+─────   ─────────          ────────────────
+1       Unit               DB connection, schema creation, auth middleware
+2       Unit               All 11 indicator calculations, registry lookup
+3       Unit               Risk validation (7 checks), trade param validation
+4       Unit               Strategy signal logic (4 strategies), registry
+5       Unit + Integration DB queries (real local DB), portfolio allocation,
+                           REST endpoint round-trips (supertest), WebSocket events
+6       Unit               Zustand stores, API client modules
+7       Unit + E2E smoke   Component rendering, login → dashboard flow (Playwright)
+8-10    Unit + Integration Per-feature tests as each UI tab is built
+```
 
-### Step 11.4: Client Integration Tests
-- API client tests
-- WebSocket event handling
+### Step 11.1: Server Unit Test Gaps
+- Bybit mapper edge cases (raw → unified type conversion)
+- Exchange error translation (rate limit, auth, network)
+- Candle service cache hit/miss/expiry
+- Funding service Z-score math validation
+- Universe scanner filtering logic
+
+### Step 11.2: Server Integration Tests (expand from Phase 5 baseline)
+- Bybit API connectivity (testnet) — real exchange calls
+- Full trade lifecycle: create → fill → SL/TP update → close → PnL check
+- Strategy executor: warmup → candle feed → signal → order (mock exchange)
+- Portfolio manager: equity snapshot → allocation check → drawdown trigger
+- Backtest execution: run strategy over historical data, verify results match
+- WebSocket: client connect → subscribe → receive broadcast → disconnect
+
+### Step 11.3: Client Unit Test Gaps
+- Zustand store edge cases (reconnection, stale data)
+- Component rendering with various data states (loading, empty, error)
+- Chart interactions (zoom, crosshair, indicator toggle)
+
+### Step 11.4: End-to-End Tests (expand from Phase 7 baseline)
+- Full auth flow: register → login → token refresh → protected route
+- Trade flow: login → place trade → see position → update SL → close
+- Strategy flow: view strategies → pause → resume → check state change
+- Portfolio flow: view dashboard → check equity → view allocation breakdown
+- WebSocket reconnection: disconnect → auto-reconnect → resume data
+
+### Step 11.5: Edge Case & Load Testing
+- Concurrent trade submissions (race conditions)
+- Exchange API timeout handling
+- Database connection pool exhaustion
+- WebSocket with 50+ concurrent clients
+- Large backtest (1000+ trades, 1 year of data)
+- Strategy signal flood (all 4 strategies signaling simultaneously)
 
 ### What you need to do for Phase 11
 - Nothing
@@ -748,8 +889,10 @@ client/
 - `scripts/setup/init-database.ts` — create schema
 - `scripts/setup/generate-jwt-secret.ps1` — JWT secret generation
 - `scripts/dev/start-dev.ps1` — start dev server + client
-- `scripts/dev/reset-database.ts` — drop and recreate (dev only)
+- `scripts/dev/reset-database.ts` — drop all tables and recreate (dev only, requires --confirm)
 - `scripts/dev/seed-test-data.ts` — test trades/accounts for UI dev
+- `scripts/db/migrate.ts` — apply pending SQL migrations
+- `scripts/db/migrate-status.ts` — show applied/pending migrations
 - `scripts/backtest/run-backtest.ts` — CLI backtest runner
 - `scripts/backtest/run-portfolio-backtest.ts` — CLI portfolio backtest
 - `scripts/maintenance/check-exchange-connection.ts` — verify Bybit API
@@ -877,6 +1020,176 @@ All of this goes into `chartWorkarounds.ts`:
 6. Calendar intervals (D/W/M): update existing candle, don't add new
 7. Markers must be sorted by time
 8. `lockVisibleTimeRangeOnResize: true` prevents viewport jumps on resize
+
+---
+
+## Server Initialization Process
+
+The server follows a strict ordered startup sequence. Each step depends on the previous ones.
+
+### Startup Sequence
+
+```
+Phase    Step  Action                                          Depends On    Failure Mode
+─────    ────  ──────                                          ──────────    ────────────
+BOOT     1     Load environment variables (.env)               Nothing       FATAL — exit
+BOOT     2     Initialize logger                               Nothing       FATAL — exit
+BOOT     3     Initialize notification service (Slack)         Nothing       Non-blocking — continue without
+CONNECT  4     Connect to PostgreSQL + run schema migration    Step 2        Warn + continue (limited mode)
+CONNECT  5     Initialize Bybit REST adapter                   Step 4        Warn — exchange features disabled
+CONNECT  6     Create HTTP server + Express app                Step 2        FATAL — exit
+CONNECT  7     Initialize client WebSocket server (/ws)        Step 6        Warn — no real-time to clients
+CONNECT  8     Initialize Bybit WebSocket (market data)        Step 5        Warn — no real-time market data
+CONNECT  9     Subscribe Bybit private channels (per account)  Step 4, 8     Warn — no live trade updates
+SERVICES 10    Start portfolio equity tracker (5-min snaps)    Step 4, 5     Warn — no equity tracking
+SERVICES 11    Start funding rate poller (5-min cycle)         Step 5        Warn — no funding data
+SERVICES 12    Start strategy executor (if strategies active)  Steps 4-11    Warn — strategies paused
+MONITOR  13    Start system health monitoring                  All above     Non-blocking
+FINAL    14    Generate initialization summary log             All above     Non-blocking
+FINAL    15    Send Slack startup notification                 Step 3        Non-blocking
+FINAL    16    Begin listening on PORT                         Step 6        FATAL — exit
+```
+
+### Error Handling (Process-Level)
+
+```typescript
+// EADDRINUSE — port conflict
+//   Dev: auto-kill conflicting process + retry (max 2 attempts)
+//   Prod: log critical error + exit (let container orchestrator restart)
+
+// unhandledRejection — catch-all for unhandled promise rejections
+//   Log error, do NOT crash (keep server running)
+
+// uncaughtException — catch-all for uncaught errors
+//   Log error + exit (state may be corrupt, restart is safer)
+```
+
+### Graceful Shutdown Sequence
+
+```
+Signal   Step  Action                                    Timeout
+──────   ────  ──────                                    ───────
+SIGTERM  1     Send Slack "shutting down" notification   Non-blocking
+SIGTERM  2     Pause all active strategies               Immediate
+SIGTERM  3     Close Bybit WebSocket connections         1s
+SIGTERM  4     Close client WebSocket server             1s
+SIGTERM  5     Close HTTP server (stop accepting)        5s
+SIGTERM  6     Disconnect database pool                  2s
+SIGTERM  7     Force exit if not done                    10s total
+```
+
+### DB Keepalive (Neon Cold-Start Prevention)
+
+In production (Neon), the database connection pool sends a lightweight `SELECT 1` ping every 60 seconds to prevent cold-start latency on the serverless PostgreSQL instance. This runs as a background interval after successful database connection.
+
+### Initialization Summary
+
+After all services initialize, a structured summary is logged showing the status of every component:
+- Server (port, environment, node version)
+- Database (connected/failed, host, name)
+- Exchange (configured/disabled, API key prefix)
+- WebSocket (connected/disconnected)
+- Strategies (active count, paused count)
+- Notifications (Slack enabled/disabled)
+- ML Service (future — connected/disabled)
+
+---
+
+## Future: ML Signal Service (FreqTrade-Based)
+
+### Overview
+A FreqTrade-based machine learning container that runs independently and provides trading signals to the main server. Trained models generate entry/exit signals with confidence scores that integrate with existing strategies.
+
+### Architecture
+- **Separate Docker container** running FreqTrade with custom ML strategies
+- **HTTP API** for signal retrieval (GET /signals/:symbol, GET /models/status)
+- **Integration modes**: Confirm, Veto, Boost, or Independent signals
+- **Signal types**: Entry, Exit, Hold, Adjust — each with confidence score (0-1)
+
+### Integration Points
+- Strategy executor queries ML service for signals before/after its own logic
+- ML confidence score adjusts position sizing (Boost mode)
+- ML signals can independently trigger trades (future Strategy 5)
+- Signal expiry prevents acting on stale predictions
+- Model status monitoring via system health checks
+
+### Files (future)
+```
+ml/
+├── Dockerfile
+├── freqtrade/
+│   ├── config.json
+│   ├── strategies/
+│   │   ├── ml_trend_classifier.py
+│   │   └── ml_regime_detector.py
+│   └── user_data/
+│       └── models/
+├── api/
+│   ├── server.py              # Flask/FastAPI signal endpoint
+│   └── signal_types.py        # Signal schema
+└── training/
+    ├── train_model.py
+    └── feature_engineering.py
+```
+
+### Server-side interface (already scaffolded)
+- `server/src/services/strategy/mlSignalTypes.ts` — TypeScript types for ML signals
+- Config: `ML_SERVICE_URL`, `ML_SERVICE_ENABLED` in .env
+
+---
+
+## Notification Service (Slack)
+
+### Overview
+Cross-cutting notification service integrated with monitoring, logging, trading, and portfolio systems. Initially uses Slack webhooks, extensible to other channels (Discord, email, SMS).
+
+### Alert Sources
+| Source | Events | Level |
+|--------|--------|-------|
+| **Trading** | Trade opened, closed, stopped out | info / warning |
+| **Portfolio** | Circuit breaker triggered/released, drawdown alerts | critical / warning |
+| **Monitoring** | Health status changes (DB, exchange, WS down) | warning / critical |
+| **Logging** | Error escalation (repeated errors) | critical |
+| **System** | Server startup, shutdown, deployment | info |
+| **ML Service** (future) | Model status, signal summary | info |
+
+### Setup
+1. Create Slack app at https://api.slack.com/apps
+2. Enable Incoming Webhooks
+3. Add webhook to channel (e.g., #algo-trading)
+4. Set `SLACK_WEBHOOK_URL` in .env
+
+---
+
+## Multi-User Account-Scoped Architecture (Completed with Phase 5)
+
+### Architecture
+- **Account-centric scoping**: `trading_account_id` is the universal scoping key
+- Each user has TEST + LIVE trading accounts (separate Bybit testnet/mainnet API keys)
+- Client sends `X-Trading-Account-Id` header; server validates ownership
+- `admin` role bypasses ownership checks; can access all accounts
+- Server background services operate across ALL active accounts
+
+### Schema Changes
+- `portfolio_snapshots` + `strategy_performance`: added `trading_account_id` FK
+- New table: `account_strategy_configs` (per-account strategy overrides with params, enable/disable)
+- Removed hardcoded admin user; first admin created via `scripts/create-admin.ts`
+
+### Service Refactoring
+- **Exchange Manager**: per-account adapter cache (lazy creation from DB credentials), `getForAccount(id)` + `getDefault()`
+- **Portfolio Manager / Equity Tracker / Circuit Breaker**: all methods take `tradingAccountId`, per-account state maps
+- **Strategy Executor**: per-account runner sets, account-scoped pause/resume
+- **Trade Service**: all exchange calls use `getForAccount(trade.trading_account_id)`
+- **Signal Processor**: uses account adapter for equity/ticker lookups
+- **WebSocket**: `broadcastToAccount(tradingAccountId, ...)` + `switch_account` message type
+
+### Middleware
+- `resolveAccount`: validates account ownership + admin bypass, attaches `req.tradingAccountId`
+- `optionalAccount`: extracts account ID without requiring it
+
+### Routes Updated
+- Portfolio, Strategy, Trading routes all require `resolveAccount` middleware
+- Market data routes remain public (use system-level default adapter)
 
 ---
 
