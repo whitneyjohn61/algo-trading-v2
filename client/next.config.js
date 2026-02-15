@@ -11,10 +11,8 @@ const nextConfig = {
   typescript: {
     ignoreBuildErrors: false,
   },
-  // Enable standalone output for Docker deployment
-  output: process.env.NODE_ENV === 'production' ? 'standalone' : undefined,
-  // Set output file tracing root to client directory
-  outputFileTracingRoot: __dirname,
+  // Enable standalone output for Docker deployment only (not Vercel)
+  output: process.env.STANDALONE === 'true' ? 'standalone' : undefined,
   images: {
     remotePatterns: [],
   },
